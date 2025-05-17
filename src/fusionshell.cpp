@@ -1,52 +1,94 @@
+#include "fusionshell.h"
+#include "parser.h"
 #include "executor.h"
 #include <iostream>
-#include <unistd.h>
+#include <signal.h>
+#include <sstream>
 #include <sys/wait.h>
-#include <cstring>
+#include <termios.h>
+#include <unistd.h>
 
-void execute_command(const ParsedCommand& parsed, bool& running, JobControl& job_control) {
-    if (parsed.tokens.empty()) {
-        return;
-    }
+static FusionShell* shell_instance = nullptr;
 
-    std::string command;
-    for (const auto& t : parsed.tokens) {
-        command += t + " ";
-    }
+FusionShell::FusionShell() : running(true), job_control() {
+    shell_instance = this;
+    setpgid(0, 0);
+    tcsetpgrp(STDIN_FILENO, getpid());
+    setup_signal_handlers();
+}
 
-    pid_t pid = fork();
-    if (pid == -1) {
-        std::cerr << "Error: Fork failed\n";
-        return;
-    }
-
-    if (pid == 0) {
-        setpgid(0, 0);
-        std::cerr << "Child PID " << getpid() << " PGID " << getpgid(0) << "\n";
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        signal(SIGTTIN, SIG_DFL);
-        signal(SIGTTOU, SIG_DFL);
-
-        std::vector<char*> args;
-        for (const auto& token : parsed.tokens) {
-            args.push_back(const_cast<char*>(token.c_str()));
+void FusionShell::setup_signal_handlers() {
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGCHLD, [](int) {
+        pid_t pid;
+        int status;
+        while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+            if (shell_instance) {
+                shell_instance->job_control.handle_child_signal(pid, status);
+            }
         }
-        args.push_back(nullptr);
+    });
+}
 
-        execvp(args[0], args.data());
-        std::cerr << "Error: Command '" << parsed.tokens[0] << "' not found\n";
-        exit(1);
-    } else {
-        setpgid(pid, pid);
-        std::cerr << "Parent set PGID for PID " << pid << " to " << pid << "\n";
-        job_control.add_job(pid, command, parsed.is_background);
-        if (!parsed.is_background) {
-            tcsetpgrp(STDIN_FILENO, pid);
-            int status;
-            waitpid(pid, &status, WUNTRACED);
-            job_control.handle_child_signal(pid, status);
-            job_control.restore_terminal_control();
+void FusionShell::run() {
+    std::string input;
+
+    while (running) {
+        job_control.restore_terminal_control();
+        std::cout << "fusionshell> ";
+        std::cout.flush();
+
+        if (!std::getline(std::cin, input)) {
+            break;
+        }
+
+        if (input.empty()) {
+            continue;
+        }
+
+        auto parsed = parse_command(input);
+        if (parsed.tokens.empty()) {
+            continue;
+        }
+
+        if (parsed.tokens[0] == "exit") {
+            running = false;
+        } else if (parsed.tokens[0] == "jobs") {
+            job_control.print_jobs();
+        } else if (parsed.tokens[0] == "fg" && parsed.tokens.size() > 1) {
+            int job_id;
+            std::stringstream ss(parsed.tokens[1]);
+            if (ss >> job_id) {
+                Job* job = job_control.find_job_by_id(job_id);
+                if (job) {
+                    job_control.set_foreground(job->pid);
+                } else {
+                    std::cerr << "No such job: " << job_id << "\n";
+                }
+            } else {
+                std::cerr << "Invalid job ID\n";
+            }
+        } else if (parsed.tokens[0] == "bg" && parsed.tokens.size() > 1) {
+            int job_id;
+            std::stringstream ss(parsed.tokens[1]);
+            if (ss >> job_id) {
+                Job* job = job_control.find_job_by_id(job_id);
+                if (job) {
+                    job->is_background = true;
+                    job->is_stopped = false;
+                    kill(-job->pid, SIGCONT);
+                    std::cout << "[" << job->job_id << "] " << job->command << " &\n";
+                } else {
+                    std::cerr << "No such job: " << job_id << "\n";
+                }
+            } else {
+                std::cerr << "Invalid job ID\n";
+            }
+        } else {
+            execute_command(parsed, running, job_control);
         }
     }
 }
