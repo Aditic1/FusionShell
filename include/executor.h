@@ -1,9 +1,9 @@
 #ifndef EXECUTOR_H
 #define EXECUTOR_H
 
-#include "job_control.h"
 #include "parser.h"
+#include "job_control.h"
 
-void execute_command(const ParsedCommand& parsed, bool& running, JobControl& job_control);
+void execute_command(const ParsedCommand& cmd, bool& running, JobControl& job_control);
 
 #endif // EXECUTOR_H
